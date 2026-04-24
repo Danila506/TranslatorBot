@@ -65,6 +65,45 @@ async def translate_foreign_to_ru(text: str) -> tuple[str | None, str]:
 
     return translated_text, source_lang
 
+
+async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        data = await reader.read(1024)
+        request = data.decode("utf-8", errors="ignore")
+        first_line = request.splitlines()[0] if request else ""
+        path = "/"
+        if first_line:
+            parts = first_line.split(" ")
+            if len(parts) >= 2:
+                path = parts[1]
+
+        if path in {"/", "/healthz"}:
+            body = b"ok"
+            status = b"200 OK"
+        else:
+            body = b"not found"
+            status = b"404 Not Found"
+
+        response = (
+            b"HTTP/1.1 " + status + b"\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(response)
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def run_health_server(port: int) -> None:
+    server = await asyncio.start_server(_health_handler, host="0.0.0.0", port=port)
+    print(f"health server started on 0.0.0.0:{port}")
+    async with server:
+        await server.serve_forever()
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
     if message.chat.type not in {"group", "supergroup"}:
@@ -102,7 +141,15 @@ async def main():
     me = await bot.get_me()
     bot_id = me.id
     print(f"bot started: @{me.username} (id={bot_id})")
-    await dp.start_polling(bot)
+    port_raw = os.getenv("PORT")
+    if port_raw:
+        port = int(port_raw)
+        await asyncio.gather(
+            dp.start_polling(bot),
+            run_health_server(port),
+        )
+    else:
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
