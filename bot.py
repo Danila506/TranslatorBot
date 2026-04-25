@@ -2,6 +2,7 @@ import os
 import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from aiohttp import web
 from dotenv import load_dotenv
 from deep_translator import GoogleTranslator
 from langdetect import DetectorFactory, LangDetectException, detect
@@ -30,6 +31,9 @@ if single_chat_id_raw:
             discussion_chat_ids.add(int(value))
 
 bot_id: int | None = None
+webhook_host = os.getenv("WEBHOOK_HOST", "").strip()
+webhook_path = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
 
 
 def is_probably_russian(text: str) -> bool:
@@ -65,91 +69,85 @@ async def translate_foreign_to_ru(text: str) -> tuple[str | None, str]:
 
     return translated_text, source_lang
 
-
-async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    try:
-        data = await reader.read(1024)
-        request = data.decode("utf-8", errors="ignore")
-        first_line = request.splitlines()[0] if request else ""
-        path = "/"
-        if first_line:
-            parts = first_line.split(" ")
-            if len(parts) >= 2:
-                path = parts[1]
-
-        if path in {"/", "/healthz"}:
-            body = b"ok"
-            status = b"200 OK"
-        else:
-            body = b"not found"
-            status = b"404 Not Found"
-
-        response = (
-            b"HTTP/1.1 " + status + b"\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
-            b"Connection: close\r\n\r\n" + body
-        )
-        writer.write(response)
-        await writer.drain()
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-async def run_health_server(port: int) -> None:
-    server = await asyncio.start_server(_health_handler, host="0.0.0.0", port=port)
-    print(f"health server started on 0.0.0.0:{port}")
-    async with server:
-        await server.serve_forever()
-
-
 @dp.message(F.text)
 async def handle_message(message: Message):
     if message.chat.type not in {"group", "supergroup"}:
-        print("skip: not group/supergroup")
         return
 
-    print("chat_id:", message.chat.id, "type:", message.chat.type, "title:", message.chat.title)
     if discussion_chat_ids and message.chat.id not in discussion_chat_ids:
-        print(f"skip: chat not allowed ({message.chat.id})")
         return
 
     if bot_id is not None and message.from_user and message.from_user.id == bot_id:
-        print("skip: message from this bot")
         return
 
     if not message.text or message.text.startswith("/"):
-        print(f"skip: empty or command text={message.text!r}")
         return
 
     try:
-        print("translate: start")
         translated, source_lang = await translate_foreign_to_ru(message.text)
-        print(f"source_lang={source_lang}; text={message.text!r}; translated={translated!r}")
         if not translated:
-            print("skip: no translated text")
             return
         await message.reply(f"Перевод ({source_lang} -> ru):\n{translated}")
-        print("translate: reply sent")
     except Exception as error:
         print(f"Ошибка перевода: {error!r}")
-        await message.reply("Не удалось выполнить перевод (ошибка сервиса).")
+        try:
+            await message.reply("Не удалось выполнить перевод (ошибка сервиса).")
+        except Exception:
+            pass
+
+
+async def health_handler(_: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def webhook_handler(request: web.Request) -> web.Response:
+    if webhook_secret:
+        incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if incoming_secret != webhook_secret:
+            return web.Response(status=403, text="forbidden")
+
+    update_data = await request.json()
+    await dp.feed_raw_update(bot=bot, update=update_data)
+    return web.Response(text="ok")
+
+
+async def run_webhook_server(port: int) -> None:
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/healthz", health_handler)
+    app.router.add_post(webhook_path, webhook_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"webhook server started on 0.0.0.0:{port}; path={webhook_path}")
+
+    # Держим процесс живым.
+    while True:
+        await asyncio.sleep(3600)
 
 async def main():
     global bot_id
     me = await bot.get_me()
     bot_id = me.id
     print(f"bot started: @{me.username} (id={bot_id})")
-    port_raw = os.getenv("PORT")
-    if port_raw:
-        port = int(port_raw)
-        await asyncio.gather(
-            dp.start_polling(bot),
-            run_health_server(port),
+
+    if webhook_host:
+        port = int(os.getenv("PORT", "10000"))
+        webhook_url = f"{webhook_host.rstrip('/')}{webhook_path}"
+        await bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True,
+            secret_token=webhook_secret,
         )
-    else:
-        await dp.start_polling(bot)
+        print(f"webhook set: {webhook_url}")
+        await run_webhook_server(port)
+        return
+
+    print("WEBHOOK_HOST not set, fallback to polling mode")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
