@@ -34,6 +34,8 @@ bot_id: int | None = None
 webhook_host = os.getenv("WEBHOOK_HOST", "").strip()
 webhook_path = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
 webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
+render_external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+is_render = os.getenv("RENDER", "").lower() == "true"
 
 
 def is_probably_russian(text: str) -> bool:
@@ -121,7 +123,7 @@ async def run_webhook_server(port: int) -> None:
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
-    print(f"webhook server started on 0.0.0.0:{port}; path={webhook_path}")
+    print(f"webhook server started on 0.0.0.0:{port}; path={webhook_path}", flush=True)
 
     # Держим процесс живым.
     while True:
@@ -131,21 +133,29 @@ async def main():
     global bot_id
     me = await bot.get_me()
     bot_id = me.id
-    print(f"bot started: @{me.username} (id={bot_id})")
+    print(f"bot started: @{me.username} (id={bot_id})", flush=True)
 
-    if webhook_host:
+    effective_webhook_host = webhook_host or render_external_url
+
+    if effective_webhook_host:
         port = int(os.getenv("PORT", "10000"))
-        webhook_url = f"{webhook_host.rstrip('/')}{webhook_path}"
+        webhook_url = f"{effective_webhook_host.rstrip('/')}{webhook_path}"
         await bot.set_webhook(
             url=webhook_url,
             drop_pending_updates=True,
             secret_token=webhook_secret,
         )
-        print(f"webhook set: {webhook_url}")
+        print(f"webhook set: {webhook_url}", flush=True)
         await run_webhook_server(port)
         return
 
-    print("WEBHOOK_HOST not set, fallback to polling mode")
+    if is_render:
+        raise ValueError(
+            "Webhook mode is required on Render. Set WEBHOOK_HOST=https://<service>.onrender.com "
+            "or ensure RENDER_EXTERNAL_URL is available."
+        )
+
+    print("WEBHOOK_HOST not set, fallback to polling mode", flush=True)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
